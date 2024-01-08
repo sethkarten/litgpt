@@ -15,7 +15,12 @@ from lit_gpt.utils import incremental_save
 
 
 @torch.inference_mode()
-def convert_checkpoint(checkpoint_file: Path, tokenizer_dir: Path, config_name: str, output_dir: Path) -> None:
+def convert_checkpoint(
+    checkpoint_file: Path, 
+    output_dir: Path,
+    tokenizer_dir: Path = Path("/teamspace/s3_connections/tinyllama-template/checkpoints/Llama-2-7b-hf"),
+    config_name: str = "", 
+) -> None:
     """Convert a checkpoint after pretraining.
 
     The pretrained checkpoint contains optimizer states and several other metadata that are not needed after training

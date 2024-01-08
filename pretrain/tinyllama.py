@@ -268,13 +268,13 @@ def create_dataloaders(batch_size: int, block_size: int) -> Tuple[DataLoader, Da
 
     train_datasets = [
         StreamingDataset(
-            input_dir="data/slimpajama/train",
+            input_dir="/teamspace/s3_connections/tinyllama-template/slimpajama/train",
             item_loader=TokensLoader(block_size=effective_block_size),
             shuffle=True,
             drop_last=True,
         ),
         StreamingDataset(
-            input_dir="data/starcoder",
+            input_dir="/teamspace/s3_connections/tinyllama-template/starcoder",
             item_loader=TokensLoader(block_size=effective_block_size),
             shuffle=True,
             drop_last=True,
@@ -289,7 +289,7 @@ def create_dataloaders(batch_size: int, block_size: int) -> Tuple[DataLoader, Da
     )
 
     val_dataset = StreamingDataset(
-        input_dir="data/slimpajama/val",
+        input_dir="/teamspace/s3_connections/tinyllama-template/slimpajama/val",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         # Consider setting to False, but we would lose some samples due to truncation when world size > 1
