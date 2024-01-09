@@ -64,7 +64,7 @@ log_iter_interval = log_step_interval * gradient_accumulation_steps
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
 
-def setup(resume: Union[bool, Path] = False):
+def setup(resume: Union[bool, Path] = False, context_size: int = 2048):
     logger = choose_logger(logger_name, name=name, resume=resume)
 
     strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
@@ -75,14 +75,14 @@ def setup(resume: Union[bool, Path] = False):
     if logger_name in ("tensorboard", "wandb"):
         fabric.logger.log_hyperparams(hparams)
 
-    main(fabric, resume)
+    main(fabric, resume, context_size)
 
 
-def main(fabric, resume):
+def main(fabric, resume, context_size):
     if fabric.global_rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    config = Config.from_name(model_name)
+    config = Config.from_name(model_name, block_size=context_size)
 
     train_dataloader, val_dataloader = create_dataloaders(batch_size=micro_batch_size, block_size=config.block_size)
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
