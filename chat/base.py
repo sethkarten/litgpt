@@ -190,6 +190,12 @@ def main(
 
 def prompt_config(checkpoint_dir: Path, tokenizer: Tokenizer) -> Tuple[str, Tuple[List[int], ...]]:
     checkpoint_name = str(checkpoint_dir)
+    system_prompt = ("\n\nHuman: {prompt}\n\nAssistant:")
+    stop_tokens = ([tokenizer.eos_id],)
+    print(system_prompt)
+    return system_prompt, stop_tokens
+
+    checkpoint_name = str(checkpoint_dir)
     if re.search(r"stabilityai.*tuned-alpha", checkpoint_name):
         system_prompt = (
             "<|SYSTEM|># StableLM Tuned (Alpha version)\n- StableLM is a helpful and harmless open-source AI language"
