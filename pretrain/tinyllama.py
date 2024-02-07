@@ -114,7 +114,11 @@ def setup(resume: Union[bool, Path] = False, context_size: int = 2048):
         # FULL_SHARD:   Use for very large models that don't fit into a machine. The model gets sharded
         #               across all GPUs on all machines. Requires a cluster with fast inter-node network (like on Lightning AI)
         #               You typically need this with models above 3B parameters.
-        sharding_strategy="HYBRID_SHARD"
+        sharding_strategy="HYBRID_SHARD",
+
+        # Enable activation checkpointing to save memory, if needed
+        # Training will be slower if this is enabled
+        # activation_checkpointing_policy={Block},
     )
     
     fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-true", loggers=[logger])
