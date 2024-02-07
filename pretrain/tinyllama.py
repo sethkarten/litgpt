@@ -29,24 +29,54 @@ from lit_gpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from lit_gpt.packed_dataset import CombinedDataset
 from lit_gpt.utils import CycleIterator, chunked_cross_entropy, num_parameters
 
+# ---------------
 # System settings
+# ---------------
+
+# The model name determines the architecture of the model
+# See lit_gpt/config.py for a list of supported models
+# For example, set Llama-2-7b-hf
 model_name = "tiny-llama-1.1b"
+
+# Name of the folder where logs and checkpoints will be saved
 name = "lit-tiny-llama-1.1b"
 out_dir = Path(os.getenv("LIGHTNING_ARTIFACTS_DIR", "out")) / name
+
+# Choose 'tensorboard', 'wandb', or 'csv'
 logger_name = "tensorboard"
+
+# Training will require all GPUs. Not recommended to run on CPU.
 devices = torch.cuda.device_count() or 1
 
+# ---------------
 # Hyperparameters
-global_batch_size = 512
+# ---------------
+
+# The learning rate, try to tune it if you deviate a lot from the TinyLlama architecture,
+# sequence length, batch size, etc. See also 'warmup_steps' below
 learning_rate = 4e-4
+
+# The total batch size within a single machine
+global_batch_size = 512
+
+# Set micro batch size as high as possible to efficiently use your GPU memory and push GPUs to 99%+ utilization
+# Lower it if you are short on memory
 micro_batch_size = 4
+
+# Stop training after this many tokens have been trained on (across all GPUs)
 max_tokens = int(3e12)  # 3 trillion
+
+# The number of (optimizer) steps until reaching the max learning rate
+# After that, the learning rate will decay with cosine (see scheduler below)
 warmup_steps = 2000
+
+# Logging, evaluation, and checkpointing intervals
 log_step_interval = 1
 eval_iters = 100
 save_step_interval = 1000
 eval_step_interval = 1000
 
+# Optimizer hyperparams, leave default
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -67,7 +97,26 @@ hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str))
 def setup(resume: Union[bool, Path] = False, context_size: int = 2048):
     logger = choose_logger(logger_name, name=name, resume=resume)
 
-    strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+    strategy = FSDPStrategy(
+        # Auto-wrap policy determines which parts of the model will get sharded
+        # Here we want to shard the large transformer blocks
+        auto_wrap_policy={Block}, 
+        
+        # 'full' will save a regular checkpoint
+        # 'sharded' will save a distributed checkpoint, use if training models > 1B
+        state_dict_type="full", 
+        
+        # Sharding strategy determines how your model gets sharded across GPUs and machines
+        # HYBRID_SHARD: Use for models that fit into a single machine, e.g. TinyLlama 1B - 3B on an 8xA100
+        #               This will shard the model within the machine, but replicate across machines
+        #               Useful to avoid slow network bottleneck between machines
+        #               
+        # FULL_SHARD:   Use for very large models that don't fit into a machine. The model gets sharded
+        #               across all GPUs on all machines. Requires a cluster with fast inter-node network (like on Lightning AI)
+        #               You typically need this with models above 3B parameters.
+        sharding_strategy="HYBRID_SHARD"
+    )
+    
     fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-true", loggers=[logger])
     fabric.launch()
 
@@ -82,7 +131,35 @@ def main(fabric, resume, context_size):
     if fabric.global_rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    config = Config.from_name(model_name, block_size=context_size)
+    config = Config.from_name(
+        # Choose a name here from a selection of configs of popular models available in Lit-GPT
+        # See lit_gpt/config.py for a full list
+        # For example, set 'Llama-2-7b-hf' if you want a larger one than TinyLlama
+        model_name, 
+        # The block size, or sequence length, or context size determines how long the sequences
+        # are we use to train the model. The bigger this is, the more memory training will require!
+        # Reduce this size if you run out of memory.
+        block_size=context_size,
+
+        # Alternatively, you can select the internal sizes yourself to make a custom-sized model.
+        # There are 4 impactful sizes to choose here. For more details, see lit_gpt/model.py.
+
+        # 1.5B
+        # n_layer=32
+        # n_head=32,
+        # n_embd=2048,
+
+        # 2B
+        # n_layer=32,
+        # n_head=32,
+        # n_embd=2560,
+
+        # 3B
+        # n_layer=40,
+        # n_head=32,
+        # n_embd=2560,
+        # intermediate_size=6912,
+    )
 
     train_dataloader, val_dataloader = create_dataloaders(batch_size=micro_batch_size, block_size=config.block_size)
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
