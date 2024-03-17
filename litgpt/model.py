@@ -27,9 +27,10 @@ class GPT(nn.Module):
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
                 h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+                # ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
+        self.norm_weight = torch.nn.Parameter(torch.ones(config.n_embd))
         self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
 
@@ -92,7 +93,9 @@ class GPT(nn.Module):
 
         for block in self.transformer.h:
             x = block(x, cos, sin, mask, input_pos)
-        x = self.transformer.ln_f(x)
+
+        x = norm(self.config.norm_class_name, x, self.norm_weight, dim=-1, eps=self.config.norm_eps)
+        # x = self.transformer.ln_f(x)
         return self.lm_head(x)  # (b, t, vocab_size)
 
     @classmethod
@@ -139,9 +142,9 @@ class GPT(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.norm_1 = nn.Parameter(torch.ones(config.n_embd))
         self.attn = CausalSelfAttention(config)
-        self.norm_2 = None if config.shared_attention_norm else config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.norm_2 = None if config.shared_attention_norm else nn.Parameter(torch.ones(config.n_embd))
         self.mlp = config.mlp_class(config)
 
         self.config = config
@@ -154,10 +157,11 @@ class Block(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        n_1 = self.norm_1(x)
+        # n_1 = self.norm_1(x)
+        n_1 = norm(self.config.norm_class_name, x, self.norm_1, dim=-1, eps=self.config.norm_eps)
         h = self.attn(n_1, cos, sin, mask, input_pos)
         if self.config.parallel_residual:
-            n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
+            n_2 = n_1 if self.config.shared_attention_norm else norm(self.config.norm_class_name, x, self.norm_2, dim=-1, eps=self.config.norm_eps)
             x = self.mlp(n_2) + h + x
         else:
             if self.config.shared_attention_norm:
@@ -166,7 +170,8 @@ class Block(nn.Module):
                     " (non-parallel residual and shared attention norm)."
                 )
             x = h + x
-            x = self.mlp(self.norm_2(x)) + x
+            n = norm(self.config.norm_class_name, x, self.norm_2, dim=-1, eps=self.config.norm_eps)
+            x = self.mlp(n) + x
         return x
 
 
@@ -392,32 +397,24 @@ def build_mask_cache(max_seq_length: int, device: Optional[torch.device] = None)
     return torch.tril(ones).unsqueeze(0).unsqueeze(0)
 
 
-class RMSNorm(torch.nn.Module):
-    """Root Mean Square Layer Normalization.
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, dim: int = -1, eps: float = 1e-6, add_unit_offset: bool = False) -> torch.Tensor:
+    dtype = x.dtype
+    x = x.float()
+    # NOTE: the original RMSNorm paper implementation is not equivalent
+    norm_x = torch.mean(x * x, dim=dim, keepdim=True)
+    x_normed = x * torch.rsqrt(norm_x + eps)
+    x_normed = x_normed.to(dtype=dtype)
+    if add_unit_offset:
+        # Gemma model requires a unit offset
+        # https://github.com/google/gemma_pytorch/blob/main/gemma/model.py#L176
+        return x_normed * (1 + weight)
+    return x_normed * weight
 
-    Derived from https://github.com/bzhangGo/rmsnorm/blob/master/rmsnorm_torch.py. BSD 3-Clause License:
-    https://github.com/bzhangGo/rmsnorm/blob/master/LICENSE.
-    """
 
-    def __init__(self, size: int, dim: int = -1, eps: float = 1e-6, add_unit_offset: bool = False) -> None:
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(size))
-        self.eps = eps
-        self.dim = dim
-        self.add_unit_offset = add_unit_offset
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        # NOTE: the original RMSNorm paper implementation is not equivalent
-        norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
-        x_normed = x * torch.rsqrt(norm_x + self.eps)
-        x_normed = x_normed.to(dtype=dtype)
-        if self.add_unit_offset:
-            # Gemma model requires a unit offset
-            # https://github.com/google/gemma_pytorch/blob/main/gemma/model.py#L176
-            return x_normed * (1 + self.weight)
-        return x_normed * self.weight
-
-    def reset_parameters(self) -> None:
-        torch.nn.init.ones_(self.weight)
+def norm(name: str, x: torch.Tensor, weight: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    if name == "rms_norm":
+        return rms_norm(x, weight, dim=dim, eps=eps, add_unit_offset=True)  # TODO Gemma
+    elif name == "layer_norm":
+        return torch.nn.functional.layer_norm(x, (weight.size(0), ), weight=weight, eps=eps)
+    else:
+        raise ValueError(f"Unknown norm name: {name}")

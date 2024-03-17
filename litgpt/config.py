@@ -52,7 +52,7 @@ class Config:
     # credit https://arxiv.org/pdf/2305.13245.pdf
     n_query_groups: Optional[int] = None
     shared_attention_norm: bool = False
-    norm_class_name: Literal["LayerNorm", "RMSNorm"] = "LayerNorm"
+    norm_class_name: Literal["layer_norm", "rms_norm"] = "layer_norm"
     norm_eps: float = 1e-5
     mlp_class_name: Literal["GptNeoxMLP", "LLaMAMLP", "GemmaMLP", "LLaMAMoE"] = "GptNeoxMLP"
     gelu_approximate: str = "none"
@@ -130,13 +130,13 @@ class Config:
     @property
     def norm_class(self) -> Type:
         # `self.norm_class_name` cannot be the type to keep the config serializable
-        if self.norm_class_name == "RMSNorm":
+        if self.norm_class_name == "rms_norm":
             from functools import partial
 
-            from litgpt.model import RMSNorm
+            from litgpt.model import rms_norm
 
-            return partial(RMSNorm, add_unit_offset="Gemma" in self.name)
-        return getattr(torch.nn, self.norm_class_name)
+            return partial(rms_norm, add_unit_offset="Gemma" in self.name)
+        return getattr(torch.nn.functional, self.norm_class_name)
 
 
 ########################
