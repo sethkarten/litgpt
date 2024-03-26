@@ -48,6 +48,7 @@ def setup(
         log_interval=1,
         global_batch_size=512,
         micro_batch_size=4,
+        warmup_fraction=0.01,
         max_tokens=int(3e12),  # 3 trillion
         learning_rate=4e-4,
         weight_decay=1e-1,
@@ -55,7 +56,6 @@ def setup(
         beta2=0.95,
         max_norm=1.0,
         min_lr=4e-5,
-        lr_warmup_steps=2000,
         tie_embeddings=False,
     ),
     eval: EvalArgs = EvalArgs(interval=1000, max_iters=100),
@@ -201,6 +201,17 @@ def main(
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
+    # Save final checkpoint
+    checkpoint_file = out_dir / "final" / "lit_model.pth"
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    fabric.print(f"Saving final checkpoint to {str(checkpoint_file)!r}")
+    fabric.save(checkpoint_file, state)
+    if fabric.global_rank == 0:
+        save_hyperparameters(setup, checkpoint_file.parent)
+        if tokenizer_dir is not None:
+            copy_config_files(tokenizer_dir, checkpoint_file.parent)
+        save_config(model.config, checkpoint_file.parent)
+
 
 def fit(
     fabric: L.Fabric,
@@ -242,7 +253,8 @@ def fit(
     total_t0 = time.perf_counter()
     val_loss = "n/a"
 
-    warmup_iters = train.lr_warmup_steps * train.gradient_accumulation_iters(devices)
+    warmup_iters = train.warmup_fraction * len(train_dataloader)
+
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
             break

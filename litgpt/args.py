@@ -18,6 +18,8 @@ class TrainArgs:
     """Number of samples per data-parallel rank"""
     lr_warmup_steps: int = 100
     """Number of iterations with learning rate warmup active"""
+    warmup_fraction: float = 0.01
+    """The fraction of an epoch to use for learning rate warmup"""
     epochs: Optional[int] = None
     """Number of epochs to train on"""
     # TODO: `pretrain` is the only script using `max_tokens` explicitly. replace it with epoch_size*epochs?
