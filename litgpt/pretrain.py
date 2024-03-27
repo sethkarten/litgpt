@@ -254,6 +254,7 @@ def fit(
     val_loss = "n/a"
 
     warmup_iters = train.warmup_fraction * len(train_dataloader)
+    print("Warmup iters", warmup_iters)
 
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
