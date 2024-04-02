@@ -253,7 +253,7 @@ def fit(
     total_t0 = time.perf_counter()
     val_loss = "n/a"
 
-    warmup_iters = train.warmup_fraction * len(train_dataloader)
+    warmup_iters = int(train.warmup_fraction * len(train_dataloader) + 1)
     print("Warmup iters", warmup_iters)
 
     for train_data in train_iterator:
