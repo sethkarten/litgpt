@@ -48,6 +48,7 @@ def setup(
     precision: Optional[str] = None,
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8-training"]] = None,
     devices: Union[int, str] = 1,
+    num_nodes: int = 1,
     lora_r: int = 8,
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
@@ -81,6 +82,7 @@ def setup(
         precision: The precision to use for finetuning. Possible choices: "bf16-true", "bf16-mixed", "32-true".
         quantize: If set, quantize the model with this algorithm. See ``tutorials/quantize.md`` for more information.
         devices: How many devices/GPUs to use.
+        num_nodes: How many nodes the code is being run on.
         lora_r: The LoRA rank.
         lora_alpha: The LoRA alpha.
         lora_dropout: The LoRA dropout value.
@@ -133,11 +135,11 @@ def setup(
         plugins = BitsandbytesPrecision(quantize[4:], dtype)
         precision = None
 
-    if devices > 1:
+    if devices * num_nodes > 1:
         if quantize:
             raise NotImplementedError(
-                "Quantization is currently not supported for multi-GPU training. Please set devices=1 when using the"
-                " --quantize flag."
+                "Quantization is currently not supported for multi-GPU training. Please set devices=1 and num_nodes=1"
+                " when using the --quantize flag."
             )
         strategy = FSDPStrategy(
             auto_wrap_policy={Block},
@@ -149,13 +151,19 @@ def setup(
     else:
         strategy = "auto"
 
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=logger, plugins=plugins)
-    fabric.launch(main, devices, seed, config, data, checkpoint_dir, out_dir, train, eval, optimizer)
+    fabric = L.Fabric(
+        devices=devices,
+        num_nodes=num_nodes,
+        strategy=strategy,
+        precision=precision,
+        loggers=logger,
+        plugins=plugins,
+    )
+    fabric.launch(main, seed, config, data, checkpoint_dir, out_dir, train, eval, optimizer)
 
 
 def main(
     fabric: L.Fabric,
-    devices: int,
     seed: int,
     config: Config,
     data: DataModule,
@@ -169,7 +177,7 @@ def main(
 
     tokenizer = Tokenizer(checkpoint_dir)
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train)
-    steps_per_epoch = len(train_dataloader) // train.gradient_accumulation_iters(devices)
+    steps_per_epoch = len(train_dataloader) // train.gradient_accumulation_iters(fabric.world_size)
     lr_max_steps = min(train.epochs * steps_per_epoch, (train.max_steps or float("inf")))
 
     fabric.seed_everything(seed)  # same seed for every process to init model (FSDP)
@@ -178,7 +186,7 @@ def main(
         os.makedirs(out_dir, exist_ok=True)
 
     checkpoint_path = checkpoint_dir / "lit_model.pth"
-    with fabric.init_module(empty_init=(devices > 1)):
+    with fabric.init_module(empty_init=(fabric.world_size > 1)):
         model = GPT(config)
     mark_only_lora_as_trainable(model)
 
@@ -206,7 +214,6 @@ def main(
         scheduler,
         train_dataloader,
         val_dataloader,
-        devices,
         checkpoint_dir,
         out_dir,
         train,
@@ -243,7 +250,6 @@ def fit(
     scheduler: torch.optim.lr_scheduler,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
-    devices: int,
     checkpoint_dir: Path,
     out_dir: Path,
     train: TrainArgs,
@@ -268,7 +274,7 @@ def fit(
 
     train_iterator = CycleIterator(train_dataloader)
     throughput = ThroughputMonitor(fabric, window_size=50)
-    running_loss = RunningMean(window=train.gradient_accumulation_iters(devices), sync_on_compute=False).to(
+    running_loss = RunningMean(window=train.gradient_accumulation_iters(fabric.world_size), sync_on_compute=False).to(
         fabric.device
     )
     max_steps = train.max_steps or float("inf")
@@ -283,13 +289,13 @@ def fit(
         batch = next(train_iterator)
         input_ids, targets = batch["input_ids"], batch["labels"]
 
-        is_accumulating = iter_num % train.gradient_accumulation_iters(devices) != 0
+        is_accumulating = iter_num % train.gradient_accumulation_iters(fabric.world_size) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids, lm_head_chunk_size=128)
             # shift the targets such that output n predicts token n+1
             logits[-1] = logits[-1][..., :-1, :]
             loss = chunked_cross_entropy(logits, targets[..., 1:])
-            fabric.backward(loss / train.gradient_accumulation_iters(devices))
+            fabric.backward(loss / train.gradient_accumulation_iters(fabric.world_size))
 
         running_loss.update(loss.detach())
 

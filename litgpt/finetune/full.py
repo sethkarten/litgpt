@@ -42,6 +42,7 @@ def setup(
     out_dir: Path = Path("out/finetune/full"),
     precision: Optional[str] = None,
     devices: Union[int, str] = 1,
+    num_nodes: int = 1,
     resume: Union[bool, Literal["auto"], Path] = False,
     data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
@@ -66,6 +67,7 @@ def setup(
             /teamspace/jobs/<job-name>/share.
         precision: The precision to use for finetuning. Possible choices: "bf16-true", "bf16-mixed", "32-true".
         devices: How many devices/GPUs to use
+        num_nodes: How many nodes the code is being run on.
         resume: Path to a checkpoint directory to resume from in case training was interrupted, or ``True`` to resume
             from the latest checkpoint in ``out_dir``. An error will be raised if no checkpoint is found. Passing
             ``'auto'`` will resume from the latest checkpoint but not error if no checkpoint exists.
@@ -90,7 +92,7 @@ def setup(
         logger_name, out_dir, name=f"finetune-{config.name}", resume=bool(resume), log_interval=train.log_interval
     )
 
-    if devices > 1:
+    if devices * num_nodes > 1:
         strategy = FSDPStrategy(
             auto_wrap_policy={Block},
             activation_checkpointing_policy={Block},
@@ -101,13 +103,12 @@ def setup(
     else:
         strategy = "auto"
 
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=logger)
-    fabric.launch(main, devices, resume, seed, config, data, checkpoint_dir, out_dir, train, eval, optimizer)
+    fabric = L.Fabric(devices=devices, num_nodes=num_nodes, strategy=strategy, precision=precision, loggers=logger)
+    fabric.launch(main, resume, seed, config, data, checkpoint_dir, out_dir, train, eval, optimizer)
 
 
 def main(
     fabric: L.Fabric,
-    devices: int,
     resume: Union[bool, Literal["auto"], Path],
     seed: int,
     config: Config,
@@ -122,7 +123,7 @@ def main(
 
     tokenizer = Tokenizer(checkpoint_dir)
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train)
-    steps_per_epoch = len(train_dataloader) // train.gradient_accumulation_iters(devices)
+    steps_per_epoch = len(train_dataloader) // train.gradient_accumulation_iters(fabric.world_size)
     lr_max_steps = min(train.epochs * steps_per_epoch, (train.max_steps or float("inf")))
 
     fabric.seed_everything(seed)  # same seed for every process to init model (FSDP)
@@ -131,7 +132,7 @@ def main(
         os.makedirs(out_dir, exist_ok=True)
 
     checkpoint_path = checkpoint_dir / "lit_model.pth"
-    with fabric.init_module(empty_init=(devices > 1)):
+    with fabric.init_module(empty_init=(fabric.world_size > 1)):
         model = GPT(config)
 
     fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
@@ -151,7 +152,7 @@ def main(
         load_checkpoint(fabric, state["model"], checkpoint_path)
 
     train_time = time.perf_counter()
-    fit(fabric, state, train_dataloader, val_dataloader, devices, resume, checkpoint_dir, out_dir, train, eval, data)
+    fit(fabric, state, train_dataloader, val_dataloader, resume, checkpoint_dir, out_dir, train, eval, data)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
@@ -179,7 +180,6 @@ def fit(
     state: Dict,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
-    devices: int,
     resume: Union[bool, Literal["auto"], Path],
     checkpoint_dir: Path,
     out_dir: Path,
@@ -223,7 +223,7 @@ def fit(
             f" {initial_iter}."
         )
 
-    running_loss = RunningMean(window=train.gradient_accumulation_iters(devices), sync_on_compute=False).to(
+    running_loss = RunningMean(window=train.gradient_accumulation_iters(fabric.world_size), sync_on_compute=False).to(
         fabric.device
     )
     fabric.barrier()
@@ -234,12 +234,12 @@ def fit(
         batch = next(train_iterator)
         input_ids, targets = batch["input_ids"], batch["labels"]
 
-        is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices) != 0
+        is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(fabric.world_size) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids)
             # shift the targets such that output n predicts token n+1
             loss = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:])
-            fabric.backward(loss / train.gradient_accumulation_iters(devices))
+            fabric.backward(loss / train.gradient_accumulation_iters(fabric.world_size))
 
         running_loss.update(loss.detach())
 
