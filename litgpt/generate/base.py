@@ -4,7 +4,7 @@ import sys
 import time
 from pathlib import Path
 from pprint import pprint
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, List
 import warnings
 
 import lightning as L
@@ -73,8 +73,25 @@ def sample(
     return torch.argmax(logits, dim=-1, keepdim=True)
 
 
-def next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+def next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, debug=False, actions=None, **kwargs: Any) -> torch.Tensor:
     logits = model(x, input_pos)
+    if actions != None:
+        if len(actions) == 0:
+            actions = None
+    if debug or actions != None: 
+        # Positions to keep
+        positions_to_keep = [17790, 3479]
+        if actions != None:
+            positions_to_keep = actions
+
+        # Create a mask with -inf (negative infinity) for all positions except the ones to keep
+        mask = torch.full(logits.shape, float('-inf'), device=logits.device, dtype=logits.dtype)
+
+        # Set the values at the positions to keep to 0
+        mask[:, :, positions_to_keep] = 0
+
+        # Apply the mask to the logits
+        logits = logits + mask
     next = sample(logits, **kwargs)
     return next.to(dtype=x.dtype)
 
@@ -90,6 +107,7 @@ def generate(
     top_p: float = 1.0,
     eos_id: Optional[int] = None,
     include_prompt: bool = True,
+    actions: List[List[List[torch.Tensor]]] = None
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
@@ -131,19 +149,95 @@ def generate(
         tokens = [prompt]
     else:
         tokens = []
+    # print(token)
+    # tokens.append(token)
     input_pos = torch.tensor([T], device=device)
     token = next_token(
         model, torch.arange(0, T, device=device), prompt.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p
     ).clone()
-    tokens.append(token)
-    for _ in range(2, max_returned_tokens - T + 1):
-        token = next_token(
-            model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p
-        ).clone()
+    if actions != None:
+        # { token, switch or move output
+        token = torch.tensor([5018], device=device, dtype=prompt.view(1, -1)[0].dtype)
         tokens.append(token)
-        if token == eos_id:
-            break
+        token = next_token(
+            model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, debug=True
+        ).clone()
+        # check if action type is valid
+        action_token = token.item()
+        if action_token == 17790 and len(actions[1]) == 0:
+            action_token = 3479
+            token = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
+        if action_token == 3479 and len(actions[0]) == 0:
+            action_token = 17790
+            token = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
+        # print('action token', action_token)
+        tokens.append(token)
         input_pos = input_pos.add_(1)
+
+        # ":" token
+        token = torch.tensor([3332], device=device, dtype=tokens[0].dtype)
+        tokens.append(token)
+        # start predicting <move> or <switch>
+        # print('actions', actions)
+        valid_tokens = None
+        if action_token == 17790:   # switch
+            valid_tokens = actions[1][:][1:]
+            if len(valid_tokens) == 0:
+                if len(actions[1]) == 1:
+                    valid_tokens = actions[1]
+        elif action_token == 3479:  # move
+            valid_tokens = actions[0][:][1:]
+            if len(valid_tokens) == 0:
+                if len(actions[0]) == 1:
+                    valid_tokens = actions[0]
+        else:
+            raise ValueError(f'Invalid action token {action_token}')
+        token_counter = 0
+        valid_indices = [i for i in range(len(valid_tokens))]
+        # print(valid_tokens)
+        valid_action_tokens = [valid_tokens[i][token_counter].item() for i in valid_indices]
+
+        output_tokens_remaining = 5
+        for _ in range(2, max_returned_tokens - T + 1):
+            # print(token)
+            token_counter += 1
+            # print('possible next tokens', valid_action_tokens)
+            token = next_token(
+                model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, actions=valid_action_tokens
+            ).clone()
+            vat_old = valid_action_tokens
+            valid_action_tokens = []
+            valid_indices_old = valid_indices
+            valid_indices = []
+            # print('valid indices old', valid_indices_old)
+            for i, vat in zip(valid_indices_old, vat_old):
+                if vat == token.item():
+                    # print(len(valid_tokens[i]), token_counter)
+                    if len(valid_tokens[i]) > token_counter:
+                        valid_action_tokens.append(valid_tokens[i][token_counter].item())
+                        valid_indices.append(i)
+                        # print(vat, token.item(), i, valid_tokens[i][token_counter].item())
+            tokens.append(token)
+            if token == eos_id:
+                break
+            input_pos = input_pos.add_(1)
+            if output_tokens_remaining != 0 and len(valid_action_tokens) != 0:
+                output_tokens_remaining -= 1
+            else:
+                # "} token
+                token = torch.tensor([9388], device=device, dtype=tokens[0].dtype)
+                tokens.append(token)
+                break
+    else:
+        tokens.append(token)
+        for _ in range(2, max_returned_tokens - T + 1):
+            token = next_token(
+                model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p
+            ).clone()
+            tokens.append(token)
+            if token == eos_id:
+                break
+            input_pos = input_pos.add_(1)
     return torch.cat(tokens)
 
 

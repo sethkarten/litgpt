@@ -82,10 +82,18 @@ class BaseLitAPI(LitAPI):
 
     def decode_request(self, request: Dict[str, Any]) -> Any:
         # Convert the request payload to your model input.
-        prompt = str(request["prompt"])
+        prompt = request["prompt"]
+        # print(request['actions'])
+        encoded_moves = []
+        for move in request['actions'][0]:
+            encoded_moves.append(self.tokenizer.encode(move, device=self.device))
+        encoded_switches = []
+        for switch in request['actions'][1]:
+            encoded_switches.append(self.tokenizer.encode(switch, device=self.device))
+        encoded_actions = [encoded_moves, encoded_switches]
         prompt = self.prompt_style.apply(prompt)
         encoded = self.tokenizer.encode(prompt, device=self.device)
-        return encoded
+        return [encoded, encoded_actions]
 
 
 class SimpleLitAPI(BaseLitAPI):
@@ -103,6 +111,7 @@ class SimpleLitAPI(BaseLitAPI):
 
     def predict(self, inputs: torch.Tensor) -> Any:
         # Run the model on the input and return the output.
+        inputs, actions = inputs[0], inputs[1]
         prompt_length = inputs.size(0)
         max_returned_tokens = prompt_length + self.max_new_tokens
 
@@ -114,7 +123,8 @@ class SimpleLitAPI(BaseLitAPI):
             top_k=self.top_k,
             top_p=self.top_p,
             eos_id=self.tokenizer.eos_id,
-            include_prompt=False
+            include_prompt=False,
+            actions=actions
         )
 
         for block in self.model.transformer.h:
