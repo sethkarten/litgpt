@@ -197,7 +197,7 @@ def generate(
         # print(valid_tokens)
         valid_action_tokens = [valid_tokens[i][token_counter].item() for i in valid_indices]
 
-        output_tokens_remaining = 5
+        output_tokens_remaining = 10
         for _ in range(2, max_returned_tokens - T + 1):
             # print(token)
             token_counter += 1
