@@ -82,9 +82,9 @@ class BaseLitAPI(LitAPI):
 
     def decode_request(self, request: Dict[str, Any]) -> Any:
         # Convert the request payload to your model input.
-        system = ""
+        system_prompt = ""
         if "system" in request.keys():
-            system = request["system"]
+            system_prompt = request["system"]
         else:
             print('no system prompt found')
         prompt = request["prompt"]
@@ -96,7 +96,7 @@ class BaseLitAPI(LitAPI):
         for switch in request['actions'][1]:
             encoded_switches.append(self.tokenizer.encode(switch, device=self.device))
         encoded_actions = [encoded_moves, encoded_switches]
-        prompt = self.prompt_style.apply(prompt, system=system)
+        prompt = self.prompt_style.apply(prompt, system_prompt=system_prompt)
         encoded = self.tokenizer.encode(prompt, device=self.device)
         return [encoded, encoded_actions]
 
