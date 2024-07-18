@@ -163,6 +163,31 @@ def generate(
         input_pos = input_pos.add_(1)
     return torch.cat(tokens)
     
+
+def add_custom_token(custom_token: int, 
+                     device, 
+                     dtype, 
+                     tokens: List[torch.Tensor],
+                     model: GPT,
+                     input_pos: torch.Tensor,
+                     temperature: float,
+                     top_k: Optional[int],
+                     top_p: float,
+                     use_token: bool=True,
+                     debug: bool=False,
+                     actions: List[int] = None
+                     ):
+    token = torch.tensor([custom_token], device=device, dtype=dtype)
+    tokens.append(token)
+    input_pos = input_pos.add_(1)
+    token_new = next_token(
+        model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, debug=debug, actions=actions
+    ).clone()
+    if use_token:
+        tokens.append(token_new)
+        input_pos = input_pos.add_(1)
+    return tokens
+
 @torch.inference_mode()
 def discrete_action_generate(
     model: GPT,
@@ -174,7 +199,8 @@ def discrete_action_generate(
     top_p: float = 1.0,
     eos_id: Optional[int] = None,
     include_prompt: bool = True,
-    actions: List[List[List[torch.Tensor]]] = None
+    actions: List[List[List[torch.Tensor]]] = None,
+    thought_tokens: int = 0
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
@@ -217,32 +243,56 @@ def discrete_action_generate(
     else:
         tokens = []
     input_pos = torch.tensor([T], device=device)
-    token = next_token(
+    # Feed prompt, ignore output
+    _ = next_token(
         model, torch.arange(0, T, device=device), prompt.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p
     ).clone()
-    # { token, switch or move output
-    token = torch.tensor([5018], device=device, dtype=prompt.view(1, -1)[0].dtype)
-    tokens.append(token)
-    token = next_token(
-        model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, debug=True
-    ).clone()
+    dtype = prompt.view(1, -1)[0].dtype
+    # GET THOUGHT
+    if thought_tokens != 0:
+        # { token, ignore output
+        tokens = add_custom_token(5018, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, False)
+        # add thought id token, ignore output
+        tokens = add_custom_token(61665, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, False)
+        # add ":" token
+        tokens = add_custom_token(3332, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True)
+        token = tokens[-1]
+        # get thought
+        assert thought_tokens > 1
+        for i in range(1, thought_tokens):
+            token = next_token(
+                model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p
+            ).clone()
+            tokens.append(token)
+            # if token == eos_id:
+            #     break
+            input_pos = input_pos.add_(1)
+            if token == 498:
+                break
+            # {"thought":"You "move":"mortalspin"}
+            elif i == thought_tokens-1:
+                # ", token, ignore output
+                tokens = add_custom_token(498, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, False)
+                break
+        # GET DISCRETE ACTION
+        # " token
+        # PREDICT SWITCH OR MOVE
+        tokens = add_custom_token(330, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, debug=True)
+    else:
+        # GET DISCRETE ACTION
+        # {" token, switch or move output
+        # PREDICT SWITCH OR MOVE
+        tokens = add_custom_token(5018, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, debug=True)
     # check if action type is valid
-    action_token = token.item()
+    action_token = tokens[-1].item()
     if action_token == 17790 and len(actions[1]) == 0:
         action_token = 3479
-        token = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
+        tokens[-1] = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
     if action_token == 3479 and len(actions[0]) == 0:
         action_token = 17790
-        token = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
-    # print('action token', action_token)
-    tokens.append(token)
-    input_pos = input_pos.add_(1)
+        tokens[-1] = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
 
-    # ":" token
-    token = torch.tensor([3332], device=device, dtype=tokens[0].dtype)
-    tokens.append(token)
-    # start predicting <move> or <switch>
-    # print('actions', actions)
+    # Gather valid discrete actions
     valid_tokens = None
     if action_token == 17790:   # switch
         valid_tokens = actions[1][:][1:]
@@ -255,17 +305,19 @@ def discrete_action_generate(
             if len(actions[0]) == 1:
                 valid_tokens = actions[0]
     else:
-        raise ValueError(f'Invalid action token {action_token}')
+        raise ValueError(f'Invalid action token {action_token}\n{tokens}')
     token_counter = 0
     valid_indices = [i for i in range(len(valid_tokens))]
-    # print(valid_tokens)
     valid_action_tokens = [valid_tokens[i][token_counter].item() for i in valid_indices]
 
-    output_tokens_remaining = 10
-    for _ in range(2, max_returned_tokens - T + 1):
-        # print(token)
+    # ":" token, token added in for loop
+    # tokens = add_custom_token(3332, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, actions=valid_action_tokens)
+    token = torch.tensor([3332], device=device, dtype=dtype)
+    tokens.append(token)
+
+    output_tokens_remaining = 9
+    for _ in range(2, max_returned_tokens + 1):
         token_counter += 1
-        # print('possible next tokens', valid_action_tokens)
         token = next_token(
             model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, actions=valid_action_tokens
         ).clone()
@@ -273,14 +325,11 @@ def discrete_action_generate(
         valid_action_tokens = []
         valid_indices_old = valid_indices
         valid_indices = []
-        # print('valid indices old', valid_indices_old)
         for i, vat in zip(valid_indices_old, vat_old):
             if vat == token.item():
-                # print(len(valid_tokens[i]), token_counter)
                 if len(valid_tokens[i]) > token_counter:
                     valid_action_tokens.append(valid_tokens[i][token_counter].item())
                     valid_indices.append(i)
-                    # print(vat, token.item(), i, valid_tokens[i][token_counter].item())
         tokens.append(token)
         if token == eos_id:
             break

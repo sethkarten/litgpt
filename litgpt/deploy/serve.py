@@ -49,6 +49,7 @@ class BaseLitAPI(LitAPI):
         self.max_new_tokens = max_new_tokens
         self.top_p = top_p
         self.discrete_flag = False
+        self.thought_tokens = 0
 
     def setup(self, device: str) -> None:
         # Setup the model so it can be called in `predict`.
@@ -94,6 +95,8 @@ class BaseLitAPI(LitAPI):
             self.max_new_tokens = int(request["max_tokens"])
         if "discrete" in request.keys():
             self.discrete_flag = bool(request["discrete"])
+        if "thought_tokens" in request.keys():
+            self.thought_tokens = int(request["thought_tokens"])
         prompt = request["prompt"]
         # print(request['actions'])
         encoded_actions = None
@@ -140,7 +143,8 @@ class SimpleLitAPI(BaseLitAPI):
                 top_p=self.top_p,
                 eos_id=self.tokenizer.eos_id,
                 include_prompt=False,
-                actions=actions
+                actions=actions,
+                thought_tokens=self.thought_tokens
             )
         else:
             y = plain_generate(
