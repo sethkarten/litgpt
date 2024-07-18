@@ -106,8 +106,7 @@ def generate(
     top_k: Optional[int] = None,
     top_p: float = 1.0,
     eos_id: Optional[int] = None,
-    include_prompt: bool = True,
-    actions: List[List[List[torch.Tensor]]] = None
+    include_prompt: bool = True
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
@@ -149,95 +148,150 @@ def generate(
         tokens = [prompt]
     else:
         tokens = []
-    # print(token)
-    # tokens.append(token)
     input_pos = torch.tensor([T], device=device)
     token = next_token(
         model, torch.arange(0, T, device=device), prompt.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p
     ).clone()
-    if actions != None:
-        # { token, switch or move output
-        token = torch.tensor([5018], device=device, dtype=prompt.view(1, -1)[0].dtype)
-        tokens.append(token)
+    tokens.append(token)
+    for _ in range(2, max_returned_tokens - T + 1):
         token = next_token(
-            model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, debug=True
+            model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p
         ).clone()
-        # check if action type is valid
-        action_token = token.item()
-        if action_token == 17790 and len(actions[1]) == 0:
-            action_token = 3479
-            token = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
-        if action_token == 3479 and len(actions[0]) == 0:
-            action_token = 17790
-            token = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
-        # print('action token', action_token)
         tokens.append(token)
+        if token == eos_id:
+            break
         input_pos = input_pos.add_(1)
+    return torch.cat(tokens)
+    
+@torch.inference_mode()
+def discrete_action_generate(
+    model: GPT,
+    prompt: torch.Tensor,
+    max_returned_tokens: int,
+    *,
+    temperature: float = 1.0,
+    top_k: Optional[int] = None,
+    top_p: float = 1.0,
+    eos_id: Optional[int] = None,
+    include_prompt: bool = True,
+    actions: List[List[List[torch.Tensor]]] = None
+) -> torch.Tensor:
+    """
+    Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
+    The implementation of this function is modified from A. Karpathy's nanoGPT.
 
-        # ":" token
-        token = torch.tensor([3332], device=device, dtype=tokens[0].dtype)
-        tokens.append(token)
-        # start predicting <move> or <switch>
-        # print('actions', actions)
-        valid_tokens = None
-        if action_token == 17790:   # switch
-            valid_tokens = actions[1][:][1:]
-            if len(valid_tokens) == 0:
-                if len(actions[1]) == 1:
-                    valid_tokens = actions[1]
-        elif action_token == 3479:  # move
-            valid_tokens = actions[0][:][1:]
-            if len(valid_tokens) == 0:
-                if len(actions[0]) == 1:
-                    valid_tokens = actions[0]
-        else:
-            raise ValueError(f'Invalid action token {action_token}')
-        token_counter = 0
-        valid_indices = [i for i in range(len(valid_tokens))]
-        # print(valid_tokens)
-        valid_action_tokens = [valid_tokens[i][token_counter].item() for i in valid_indices]
+    Args:
+        model: The model to use.
+        prompt: Tensor of shape (T) with indices of the prompt sequence.
+        max_returned_tokens: The maximum number of tokens to return (given plus generated).
+        temperature: Scales the predicted logits by 1 / temperature.
+        top_k: If specified, only sample among the tokens with the k highest probabilities.
+        top_p: If specified, it represents the cumulative probability threshold to consider in the sampling process.
+            In top-p sampling, the next token is sampled from the highest probability tokens
+            whose cumulative probability exceeds the threshold `top_p`. When specified,
+            it must be `0 <= top_p <= 1`. Here, `top_p=0` is equivalent
+            to sampling the most probable token, while `top_p=1` samples from the whole distribution.
+            It can be used in conjunction with `top_k` and `temperature` with the following order
+            of application:
 
-        output_tokens_remaining = 10
-        for _ in range(2, max_returned_tokens - T + 1):
-            # print(token)
-            token_counter += 1
-            # print('possible next tokens', valid_action_tokens)
-            token = next_token(
-                model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, actions=valid_action_tokens
-            ).clone()
-            vat_old = valid_action_tokens
-            valid_action_tokens = []
-            valid_indices_old = valid_indices
-            valid_indices = []
-            # print('valid indices old', valid_indices_old)
-            for i, vat in zip(valid_indices_old, vat_old):
-                if vat == token.item():
-                    # print(len(valid_tokens[i]), token_counter)
-                    if len(valid_tokens[i]) > token_counter:
-                        valid_action_tokens.append(valid_tokens[i][token_counter].item())
-                        valid_indices.append(i)
-                        # print(vat, token.item(), i, valid_tokens[i][token_counter].item())
-            tokens.append(token)
-            if token == eos_id:
-                break
-            input_pos = input_pos.add_(1)
-            if output_tokens_remaining != 0 and len(valid_action_tokens) != 0:
-                output_tokens_remaining -= 1
-            else:
-                # "} token
-                token = torch.tensor([9388], device=device, dtype=tokens[0].dtype)
-                tokens.append(token)
-                break
+            1. `top_k` sampling
+            2. `temperature` scaling
+            3. `top_p` sampling
+
+            For more details, see https://arxiv.org/abs/1904.09751
+            or https://huyenchip.com/2024/01/16/sampling.html#top_p
+        eos_id: If specified, stop generating any more token once the <eos> token is triggered.
+        include_prompt: If true (default) prepends the prompt (after applying the prompt style) to the output.
+    """
+    T = prompt.size(0)
+    assert max_returned_tokens > T
+    if model.max_seq_length < max_returned_tokens - 1:
+        # rolling the kv cache based on the `input_pos` value would be necessary. However, doing so would introduce a
+        # data dependency on the `input_pos` tensor and impact model compilation. Since this setting is uncommon, we do
+        # not support it to avoid negatively impacting the overall speed
+        raise NotImplementedError(f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}")
+    
+    device = prompt.device
+    if include_prompt:
+        tokens = [prompt]
     else:
+        tokens = []
+    input_pos = torch.tensor([T], device=device)
+    token = next_token(
+        model, torch.arange(0, T, device=device), prompt.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p
+    ).clone()
+    # { token, switch or move output
+    token = torch.tensor([5018], device=device, dtype=prompt.view(1, -1)[0].dtype)
+    tokens.append(token)
+    token = next_token(
+        model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, debug=True
+    ).clone()
+    # check if action type is valid
+    action_token = token.item()
+    if action_token == 17790 and len(actions[1]) == 0:
+        action_token = 3479
+        token = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
+    if action_token == 3479 and len(actions[0]) == 0:
+        action_token = 17790
+        token = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
+    # print('action token', action_token)
+    tokens.append(token)
+    input_pos = input_pos.add_(1)
+
+    # ":" token
+    token = torch.tensor([3332], device=device, dtype=tokens[0].dtype)
+    tokens.append(token)
+    # start predicting <move> or <switch>
+    # print('actions', actions)
+    valid_tokens = None
+    if action_token == 17790:   # switch
+        valid_tokens = actions[1][:][1:]
+        if len(valid_tokens) == 0:
+            if len(actions[1]) == 1:
+                valid_tokens = actions[1]
+    elif action_token == 3479:  # move
+        valid_tokens = actions[0][:][1:]
+        if len(valid_tokens) == 0:
+            if len(actions[0]) == 1:
+                valid_tokens = actions[0]
+    else:
+        raise ValueError(f'Invalid action token {action_token}')
+    token_counter = 0
+    valid_indices = [i for i in range(len(valid_tokens))]
+    # print(valid_tokens)
+    valid_action_tokens = [valid_tokens[i][token_counter].item() for i in valid_indices]
+
+    output_tokens_remaining = 10
+    for _ in range(2, max_returned_tokens - T + 1):
+        # print(token)
+        token_counter += 1
+        # print('possible next tokens', valid_action_tokens)
+        token = next_token(
+            model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, actions=valid_action_tokens
+        ).clone()
+        vat_old = valid_action_tokens
+        valid_action_tokens = []
+        valid_indices_old = valid_indices
+        valid_indices = []
+        # print('valid indices old', valid_indices_old)
+        for i, vat in zip(valid_indices_old, vat_old):
+            if vat == token.item():
+                # print(len(valid_tokens[i]), token_counter)
+                if len(valid_tokens[i]) > token_counter:
+                    valid_action_tokens.append(valid_tokens[i][token_counter].item())
+                    valid_indices.append(i)
+                    # print(vat, token.item(), i, valid_tokens[i][token_counter].item())
         tokens.append(token)
-        for _ in range(2, max_returned_tokens - T + 1):
-            token = next_token(
-                model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p
-            ).clone()
+        if token == eos_id:
+            break
+        input_pos = input_pos.add_(1)
+        if output_tokens_remaining != 0 and len(valid_action_tokens) != 0:
+            output_tokens_remaining -= 1
+        else:
+            # "} token
+            token = torch.tensor([9388], device=device, dtype=tokens[0].dtype)
             tokens.append(token)
-            if token == eos_id:
-                break
-            input_pos = input_pos.add_(1)
+            break
     return torch.cat(tokens)
 
 

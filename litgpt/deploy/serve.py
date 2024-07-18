@@ -12,7 +12,7 @@ import torch
 from litgpt.model import GPT  # needs to be imported before config
 from litgpt.config import Config
 from litgpt.tokenizer import Tokenizer
-from litgpt.generate.base import generate as plain_generate
+from litgpt.generate.base import generate as plain_generate, discrete_action_generate as plain_discrete_action_generate
 from litgpt.chat.base import generate as stream_generate
 from litgpt.prompts import load_prompt_style, has_prompt_style, PromptStyle
 from litgpt.utils import (
@@ -48,6 +48,7 @@ class BaseLitAPI(LitAPI):
         self.top_k = top_k
         self.max_new_tokens = max_new_tokens
         self.top_p = top_p
+        self.discrete_flag = False
 
     def setup(self, device: str) -> None:
         # Setup the model so it can be called in `predict`.
@@ -87,15 +88,23 @@ class BaseLitAPI(LitAPI):
             system_prompt = request["system"]
         else:
             print('no system prompt found')
+        if "temperature" in request.keys():
+            self.temperature = float(request["temperature"])
+        if "max_tokens" in request.keys():
+            self.max_new_tokens = int(request["max_tokens"])
+        if "discrete" in request.keys():
+            self.discrete_flag = bool(request["discrete"])
         prompt = request["prompt"]
         # print(request['actions'])
-        encoded_moves = []
-        for move in request['actions'][0]:
-            encoded_moves.append(self.tokenizer.encode(move, device=self.device))
-        encoded_switches = []
-        for switch in request['actions'][1]:
-            encoded_switches.append(self.tokenizer.encode(switch, device=self.device))
-        encoded_actions = [encoded_moves, encoded_switches]
+        encoded_actions = None
+        if "actions" in request.keys():
+            encoded_moves = []
+            for move in request['actions'][0]:
+                encoded_moves.append(self.tokenizer.encode(move, device=self.device))
+            encoded_switches = []
+            for switch in request['actions'][1]:
+                encoded_switches.append(self.tokenizer.encode(switch, device=self.device))
+            encoded_actions = [encoded_moves, encoded_switches]
         prompt = self.prompt_style.apply(prompt, system_prompt=system_prompt)
         encoded = self.tokenizer.encode(prompt, device=self.device)
         return [encoded, encoded_actions]
@@ -119,18 +128,31 @@ class SimpleLitAPI(BaseLitAPI):
         inputs, actions = inputs[0], inputs[1]
         prompt_length = inputs.size(0)
         max_returned_tokens = prompt_length + self.max_new_tokens
-
-        y = plain_generate(
-            self.model,
-            inputs,
-            max_returned_tokens,
-            temperature=self.temperature,
-            top_k=self.top_k,
-            top_p=self.top_p,
-            eos_id=self.tokenizer.eos_id,
-            include_prompt=False,
-            actions=actions
-        )
+        
+        # generate from set of discrete actions
+        if self.discrete_flag:
+            y = plain_discrete_action_generate(
+                self.model,
+                inputs,
+                max_returned_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                eos_id=self.tokenizer.eos_id,
+                include_prompt=False,
+                actions=actions
+            )
+        else:
+            y = plain_generate(
+                self.model,
+                inputs,
+                max_returned_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                eos_id=self.tokenizer.eos_id,
+                include_prompt=False
+            )
 
         for block in self.model.transformer.h:
             block.attn.kv_cache.reset_parameters()
