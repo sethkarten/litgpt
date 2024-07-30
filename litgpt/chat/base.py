@@ -125,7 +125,7 @@ def process_prompt(prompt, model, tokenizer, prompt_style, fabric, temperature, 
     encoded_prompt = tokenizer.encode(prompt, device=fabric.device)
 
     if max_new_tokens is None:
-        max_new_tokens = model.max_seq_length
+        max_returned_tokens = model.max_seq_length
     else:
         first_turn = model.mask_cache is None
         max_returned_tokens = encoded_prompt.size(0) + max_new_tokens
@@ -180,7 +180,7 @@ def main(
     checkpoint_dir: Path,
     *,
     max_new_tokens: int = 50,
-    top_k: Optional[int] = 200,
+    top_k: Optional[int] = 50,
     top_p: float = 1.0,
     temperature: float = 0.8,
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8"]] = None,

@@ -73,9 +73,11 @@ class BaseLitAPI(LitAPI):
         )
         with fabric.init_module(empty_init=True):
             model = GPT(config)
-        with fabric.init_tensor():
-            # enable the kv cache
-            model.set_kv_cache(batch_size=1)
+
+        # This should be set if we add a compile feature later
+        # with fabric.init_tensor():
+        #     model.set_kv_cache(batch_size=1)
+
         model.eval()
 
         self.model = fabric.setup_module(model)
@@ -131,7 +133,11 @@ class SimpleLitAPI(BaseLitAPI):
         inputs, actions = inputs[0], inputs[1]
         prompt_length = inputs.size(0)
         max_returned_tokens = prompt_length + self.max_new_tokens
-        
+        first_turn = self.model.mask_cache is None
+        if first_turn or max_returned_tokens > self.model.max_seq_length:
+            self.model.max_seq_length = max_returned_tokens
+            self.model.set_kv_cache(batch_size=1, device=self.device)
+            
         # generate from set of discrete actions
         if self.discrete_flag:
             y = plain_discrete_action_generate(
@@ -158,8 +164,7 @@ class SimpleLitAPI(BaseLitAPI):
                 include_prompt=False
             )
 
-        for block in self.model.transformer.h:
-            block.attn.kv_cache.reset_parameters()
+        self.model.clear_kv_cache()
         return y
 
     def encode_response(self, output: torch.Tensor) -> Dict[str, Any]:
@@ -186,18 +191,23 @@ class StreamLitAPI(BaseLitAPI):
         prompt_length = inputs.size(0)
         max_returned_tokens = prompt_length + self.max_new_tokens
 
-        for block in self.model.transformer.h:
-            block.attn.kv_cache.reset_parameters()
+        first_turn = self.model.mask_cache is None
+        if first_turn or max_returned_tokens > self.model.max_seq_length:
+            self.model.max_seq_length = max_returned_tokens
+            self.model.set_kv_cache(batch_size=1, device=self.device)
 
-        yield from stream_generate(
-            self.model,
-            inputs,
-            max_returned_tokens,
-            temperature=self.temperature,
-            top_k=self.top_k,
-            top_p=self.top_p,
-            stop_tokens=([self.tokenizer.eos_id],)
-        )
+        try:
+            yield from stream_generate(
+                self.model,
+                inputs,
+                max_returned_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                stop_tokens=([self.tokenizer.eos_id],)
+            )
+        finally:
+            self.model.clear_kv_cache()
 
     def encode_response(self, output):
         for out in output:
@@ -208,7 +218,7 @@ def run_server(
     checkpoint_dir: Path,
     precision: Optional[str] = None,
     temperature: float = 0.8,
-    top_k: int = 200,
+    top_k: int = 50,
     top_p: float = 1.0,
     max_new_tokens: int = 50,
     devices: int = 1,
