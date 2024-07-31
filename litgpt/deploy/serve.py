@@ -2,9 +2,11 @@
 from pathlib import Path
 from pprint import pprint
 from typing import Dict, Any, Optional
+import warnings
 from litgpt.utils import check_valid_checkpoint_dir
 
 import lightning as L
+from lightning.fabric.plugins import BitsandbytesPrecision
 from lightning_utilities.core.imports import RequirementCache
 import torch
 
@@ -58,11 +60,27 @@ class BaseLitAPI(LitAPI):
         torch.set_float32_matmul_precision("high")
 
         precision = self.precision or get_default_supported_precision(training=False)
+        plugins = None
+        quantize = None
+        # quantize = "bnb.nf4-dq"
+        if quantize is not None and quantize.startswith("bnb."):
+            if "mixed" in precision:
+                raise ValueError("Quantization and mixed precision is not supported.")
+            if RequirementCache("bitsandbytes != 0.42.0"):
+                warnings.warn(
+                    "LitGPT only supports bitsandbytes v0.42.0. "
+                    "This may result in errors when using quantization."
+                )
+            dtype = {"16-true": torch.float16, "bf16-true": torch.bfloat16, "32-true": torch.float32}[precision]
+            plugins = BitsandbytesPrecision(quantize[4:], dtype)
+            precision = None
+
 
         fabric = L.Fabric(
             accelerator=device.type,
             devices=1 if device.type == "cpu" else [device.index],
             precision=precision,
+            plugins=plugins,
         )
         checkpoint_path = self.checkpoint_dir / "lit_model.pth"
         self.tokenizer = Tokenizer(self.checkpoint_dir)
@@ -83,6 +101,13 @@ class BaseLitAPI(LitAPI):
         self.model = fabric.setup_module(model)
         load_checkpoint(fabric, self.model, checkpoint_path)
         self.device = fabric.device
+
+        # get custom tokens for discrete actions
+        custom_tokens = ["{\"","switch", "move", "\":\"", "\"}"]
+        self.custom_tokens = {}
+        for token in custom_tokens:
+            self.custom_tokens[token] = self.tokenizer.token_to_id(token) 
+        print(self.custom_tokens)
 
     def decode_request(self, request: Dict[str, Any]) -> Any:
         # Convert the request payload to your model input.
@@ -150,6 +175,7 @@ class SimpleLitAPI(BaseLitAPI):
                 eos_id=self.tokenizer.eos_id,
                 include_prompt=False,
                 actions=actions,
+                custom_tokens=self.custom_tokens,
                 thought_tokens=self.thought_tokens
             )
         else:
@@ -275,7 +301,8 @@ def run_server(
                 max_new_tokens=max_new_tokens,
                 ),
             accelerator=accelerator,
-            devices=devices
+            devices=devices,
+            timeout=100
             )
 
     else:

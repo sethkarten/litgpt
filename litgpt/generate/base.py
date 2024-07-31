@@ -4,7 +4,7 @@ import sys
 import time
 from pathlib import Path
 from pprint import pprint
-from typing import Any, Literal, Optional, List
+from typing import Any, Dict, Literal, Optional, List
 import warnings
 
 import lightning as L
@@ -73,14 +73,14 @@ def sample(
     return torch.argmax(logits, dim=-1, keepdim=True)
 
 
-def next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, debug=False, actions=None, **kwargs: Any) -> torch.Tensor:
+def next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, debug=False, actions=None, custom_tokens=None, **kwargs: Any) -> torch.Tensor:
     logits = model(x, input_pos)
     if actions != None:
         if len(actions) == 0:
             actions = None
     if debug or actions != None: 
         # Positions to keep
-        positions_to_keep = [17790, 3479]
+        positions_to_keep = [custom_tokens["switch"], custom_tokens["move"]]
         if actions != None:
             positions_to_keep = actions
 
@@ -175,13 +175,14 @@ def add_custom_token(custom_token: int,
                      top_p: float,
                      use_token: bool=True,
                      debug: bool=False,
-                     actions: List[int] = None
+                     actions: List[int] = None,
+                     custom_tokens: List[int] = None
                      ):
     token = torch.tensor([custom_token], device=device, dtype=dtype)
     tokens.append(token)
     input_pos = input_pos.add_(1)
     token_new = next_token(
-        model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, debug=debug, actions=actions
+        model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, debug=debug, actions=actions, custom_tokens=custom_tokens
     ).clone()
     if use_token:
         tokens.append(token_new)
@@ -200,6 +201,7 @@ def discrete_action_generate(
     eos_id: Optional[int] = None,
     include_prompt: bool = True,
     actions: List[List[List[torch.Tensor]]] = None,
+    custom_tokens: Dict = None,
     thought_tokens: int = 0
 ) -> torch.Tensor:
     """
@@ -251,11 +253,11 @@ def discrete_action_generate(
     # GET THOUGHT
     if thought_tokens != 0:
         # { token, ignore output
-        tokens = add_custom_token(5018, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, False)
+        tokens = add_custom_token(5018, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, False, custom_tokens=custom_tokens)
         # add thought id token, ignore output
-        tokens = add_custom_token(61665, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, False)
+        tokens = add_custom_token(61665, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, False, custom_tokens=custom_tokens)
         # add ":" token
-        tokens = add_custom_token(3332, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True)
+        tokens = add_custom_token(custom_tokens["\":\""], device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, custom_tokens=custom_tokens)
         token = tokens[-1]
         # get thought
         assert thought_tokens > 1
@@ -272,34 +274,34 @@ def discrete_action_generate(
             # {"thought":"You "move":"mortalspin"}
             elif i == thought_tokens-1:
                 # ", token, ignore output
-                tokens = add_custom_token(498, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, False)
+                tokens = add_custom_token(498, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, False, custom_tokens=custom_tokens)
                 break
         # GET DISCRETE ACTION
         # " token
         # PREDICT SWITCH OR MOVE
-        tokens = add_custom_token(330, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, debug=True)
+        tokens = add_custom_token(330, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, debug=True, custom_tokens=custom_tokens)
     else:
         # GET DISCRETE ACTION
         # {" token, switch or move output
         # PREDICT SWITCH OR MOVE
-        tokens = add_custom_token(5018, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, debug=True)
+        tokens = add_custom_token(custom_tokens["{\""], device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, debug=True, custom_tokens=custom_tokens)
     # check if action type is valid
     action_token = tokens[-1].item()
-    if action_token == 17790 and len(actions[1]) == 0:
-        action_token = 3479
+    if action_token == custom_tokens["switch"] and len(actions[1]) == 0:
+        action_token = custom_tokens["move"]
         tokens[-1] = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
-    if action_token == 3479 and len(actions[0]) == 0:
-        action_token = 17790
+    if action_token == custom_tokens["move"] and len(actions[0]) == 0:
+        action_token = custom_tokens["switch"]
         tokens[-1] = torch.tensor([action_token], device=device, dtype=tokens[0].dtype)
 
     # Gather valid discrete actions
     valid_tokens = None
-    if action_token == 17790:   # switch
+    if action_token == custom_tokens["switch"]:   # switch
         valid_tokens = actions[1][:][1:]
         if len(valid_tokens) == 0:
             if len(actions[1]) == 1:
                 valid_tokens = actions[1]
-    elif action_token == 3479:  # move
+    elif action_token == custom_tokens["move"]:  # move
         valid_tokens = actions[0][:][1:]
         if len(valid_tokens) == 0:
             if len(actions[0]) == 1:
@@ -311,15 +313,15 @@ def discrete_action_generate(
     valid_action_tokens = [valid_tokens[i][token_counter].item() for i in valid_indices]
 
     # ":" token, token added in for loop
-    # tokens = add_custom_token(3332, device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, actions=valid_action_tokens)
-    token = torch.tensor([3332], device=device, dtype=dtype)
+    # tokens = add_custom_token(custom_tokens["\":\""], device, dtype, tokens, model, input_pos, temperature, top_k, top_p, True, actions=valid_action_tokens)
+    token = torch.tensor([custom_tokens["\":\""]], device=device, dtype=dtype)
     tokens.append(token)
 
     output_tokens_remaining = 9
     for _ in range(2, max_returned_tokens + 1):
         token_counter += 1
         token = next_token(
-            model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, actions=valid_action_tokens
+            model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k, top_p=top_p, actions=valid_action_tokens, custom_tokens=custom_tokens
         ).clone()
         vat_old = valid_action_tokens
         valid_action_tokens = []
@@ -338,7 +340,7 @@ def discrete_action_generate(
             output_tokens_remaining -= 1
         else:
             # "} token
-            token = torch.tensor([9388], device=device, dtype=tokens[0].dtype)
+            token = torch.tensor([custom_tokens["\"}"]], device=device, dtype=tokens[0].dtype)
             tokens.append(token)
             break
     return torch.cat(tokens)
