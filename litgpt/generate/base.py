@@ -199,7 +199,7 @@ def discrete_action_generate(
     top_k: Optional[int] = None,
     top_p: float = 1.0,
     eos_id: Optional[int] = None,
-    include_prompt: bool = True,
+    include_prompt: bool = False,
     actions: List[List[List[torch.Tensor]]] = None,
     custom_tokens: Dict = None,
     thought_tokens: int = 0

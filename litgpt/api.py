@@ -2,7 +2,7 @@
 #
 # This file implements the LitGPT Python API
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 import torch
 import lightning as L
@@ -12,7 +12,7 @@ from lightning.fabric.plugins import BitsandbytesPrecision
 from litgpt.model import GPT  # needs to be imported before config
 from litgpt.config import name_to_config, Config
 from litgpt.tokenizer import Tokenizer
-from litgpt.generate.base import generate as generate_fn
+from litgpt.generate.base import generate as generate_fn, discrete_action_generate as discrete_generate_fn
 from litgpt.chat.base import generate as stream_generate_fn
 from litgpt.prompts import load_prompt_style, has_prompt_style, PromptStyle
 from litgpt.utils import (
@@ -42,6 +42,11 @@ class LLM:
         self.fabric = fabric
         self.kvcache_initialized = False
         self.prev_generated_seq_length = 0
+        self.tokenizer = tokenizer
+        self.encoded_actions = None
+        self.custom_tokens = None
+        self.thought_tokens = 0
+        self.discrete_flag = False
 
     """
     LLM model class for inference, pretraining, and finetuning.
@@ -180,7 +185,7 @@ class LLM:
     @torch.inference_mode()
     def generate(
         self,
-        prompt: str,
+        prompt: Tuple[str,str],
         max_new_tokens: int = 50,
         max_seq_length: Union[int, Literal["dynamic", "max_model_supported"]] = "dynamic",
         temperature: float = 1.0,
@@ -219,7 +224,8 @@ class LLM:
                 At the moment, this setting is slower and may use more memory than the non-streaming version.
                 We plan to resolve this in the future.
         """
-        prompt = self.prompt_style.apply(prompt)
+        prompt, system_prompt = prompt[0], prompt[1]
+        prompt = self.prompt_style.apply(prompt, system_prompt=system_prompt)
         input_ids = self.preprocessor.tokenizer.encode(prompt)
         prompt_length = input_ids.size(0)
         max_returned_tokens = prompt_length + max_new_tokens
@@ -231,17 +237,10 @@ class LLM:
                 self.kvcache_initialized = False
             else:
                 for block in self.model.transformer.h:
-                    block.attn.kv_cache = None
+                    block.attn.kv_cache.reset_parameters()
 
         # Create, clear or grow the kv cache if necessary.
         max_model_supported = self.model.max_seq_length
-
-        if max_returned_tokens > max_model_supported:
-            raise ValueError(
-                    f"Cannot generate a response with {max_returned_tokens} tokens.\n"
-                    f"This model has a maximum context length of {max_model_supported} tokens.\n"
-                    f"The prompt contains {prompt_length} tokens, leaving {max_model_supported - prompt_length} for the response, which is not enough."
-                )
 
         if max_seq_length == "dynamic":
             max_seq_length_setting = max_returned_tokens
@@ -258,6 +257,13 @@ class LLM:
             max_seq_length_setting = max_seq_length
         else:
             raise ValueError(f"Invalid max_seq_length: {max_seq_length}")
+
+        if max_returned_tokens > max_seq_length_setting:
+            raise ValueError(
+                    f"Cannot generate a response with {max_returned_tokens} tokens.\n"
+                    f"This model has a maximum context length of {max_seq_length_setting} tokens.\n"
+                    f"The prompt contains {prompt_length} tokens, leaving {max_seq_length_setting - prompt_length} for the response, which is not enough."
+                )
 
         if not self.kvcache_initialized or self.prev_generated_seq_length != max_returned_tokens:
             self.model.set_kv_cache(batch_size=1, max_seq_length=max_seq_length_setting, device=self.fabric.device)
@@ -291,6 +297,8 @@ class LLM:
         if stream:
             outputs = iterator()
         else:
+            if self.discrete_flag:
+                generate_fn = discrete_generate_fn
             outputs = generate_fn(
                 model=self.model,
                 prompt=input_ids.to(self.fabric.device),
@@ -300,6 +308,9 @@ class LLM:
                 top_p=top_p,
                 eos_id=self.preprocessor.tokenizer.eos_id,
                 include_prompt=False,
+                actions=self.encoded_actions,
+                custom_tokens=self.custom_tokens,
+                thought_tokens=self.thought_tokens
             )
 
         if stream:
